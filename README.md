@@ -62,5 +62,3 @@ Dit project is vrij te gebruiken onder de MIT-licentie.
 
 ---
 
-Wil je dat ik er ook een klein screenshotvoorbeeld of GIF-voorbeeldsectie bij schrijf voor bovenaan de README (met een voorbeeld van de interface)?
-
