@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="nl">
+<meta charset="utf-8">
+<title>Seriële Monitor (WebSerial) + Export & Send</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --gap: 10px; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+  h1 { font-size: 1.2rem; margin: 0 0 12px; }
+  .bar { display: flex; flex-wrap: wrap; gap: var(--gap); align-items: center; margin-bottom: var(--gap); }
+  button, select { padding: .55rem .9rem; border-radius: .6rem; border: 1px solid #ccc; background: #fafafa; cursor: pointer; }
+  button[disabled] { opacity: .5; cursor: not-allowed; }
+  .seg { display: inline-flex; border: 1px solid #ccc; border-radius: .6rem; overflow: hidden; }
+  .seg button { border: 0; background: #f6f6f6; }
+  .seg button.active { background: white; font-weight: 600; }
+  #log {
+    box-sizing: border-box; width: 100%; height: 60vh; border: 1px solid #ddd; border-radius: .6rem;
+    background: #0b0f14; color: #dfe6ee; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 13px; line-height: 1.35; padding: 10px; overflow: auto; white-space: pre-wrap;
+  }
+  .hint { color: #444; font-size: .9rem; margin-top: 6px; }
+  .badnews { color: #b00020; }
+  .ok { color: #0a7f2e; }
+  .sendbar { display: grid; grid-template-columns: 1fr auto auto; gap: var(--gap); margin-top: var(--gap); }
+  .sendbar input[type="text"] { padding: .55rem .7rem; border-radius: .6rem; border: 1px solid #ccc; }
+</style>
+<body>
+  <h1>Seriële Monitor</h1>
+
+  <div class="bar">
+    <button id="btnConnect">Connect</button>
+    <button id="btnDisconnect" disabled>Disconnect</button>
+
+    <!-- 1) Meescrollen / 2) Manual -->
+    <div class="seg" role="group" aria-label="Scrollmodus">
+      <button id="btnAuto" class="active" title="Altijd naar nieuwste regels">Meescrollen (nieuw)</button>
+      <button id="btnManual" title="Zelf scrollen, positie blijft staan">Manueel scrollen</button>
+    </div>
+
+    <!-- 3) Pauze -->
+    <button id="btnPause" title="Pauzeer/ga door met lezen">Pauze</button>
+
+    <!-- Extra -->
+    <button id="btnClear" title="Leeg het scherm">Clear</button>
+    <button id="btnExport" title="Exporteer log naar TXT">Export .txt</button>
+
+    <label for="lineEnding" style="margin-left:auto">Line ending:</label>
+    <select id="lineEnding">
+      <option value="none">none</option>
+      <option value="lf" selected>\n</option>
+      <option value="crlf">\r\n</option>
+    </select>
+  </div>
+
+  <div id="log"></div>
+
+  <div class="sendbar">
+    <input id="sendInput" type="text" placeholder="Commando (bijv. STATUS, LED1 ON) — Enter om te versturen" />
+    <button id="btnSend">Send</button>
+    <button id="btnSendNL">Send + newline</button>
+  </div>
+
+  <div class="hint">
+    Tip: gebruik Chrome/Edge. WebSerial is niet beschikbaar in Safari/Firefox. <span id="supportMsg"></span>
+  </div>
+
+<script>
+let port, reader, writer;
+let keepReading = false;
+let paused = false;
+let autoScroll = true;
+let pausedBuffer = [];
+const decoder = new TextDecoder();
+const encoder = new TextEncoder();
+
+const el = {
+  connect: document.getElementById('btnConnect'),
+  disconnect: document.getElementById('btnDisconnect'),
+  auto: document.getElementById('btnAuto'),
+  manual: document.getElementById('btnManual'),
+  pause: document.getElementById('btnPause'),
+  clear: document.getElementById('btnClear'),
+  export: document.getElementById('btnExport'),
+  log: document.getElementById('log'),
+  supportMsg: document.getElementById('supportMsg'),
+  sendInput: document.getElementById('sendInput'),
+  btnSend: document.getElementById('btnSend'),
+  btnSendNL: document.getElementById('btnSendNL'),
+  lineEnding: document.getElementById('lineEnding'),
+};
+
+function setModeButtons() {
+  el.auto.classList.toggle('active', autoScroll);
+  el.manual.classList.toggle('active', !autoScroll);
+  el.pause.textContent = paused ? 'Hervat' : 'Pauze';
+}
+
+function logText(text, cls) {
+  if (cls) {
+    el.log.insertAdjacentHTML('beforeend', `<span class="${cls}"></span>`);
+    const last = el.log.lastElementChild;
+    last.textContent = text;
+    el.log.insertAdjacentText('beforeend', '\n');
+  } else {
+    el.log.append(document.createTextNode(text));
+    if (!text.endsWith('\n')) el.log.append(document.createTextNode('\n'));
+  }
+  if (autoScroll && !paused) {
+    el.log.scrollTop = el.log.scrollHeight;
+  }
+}
+
+function appendChunk(chunk) {
+  if (paused) { pausedBuffer.push(chunk); return; }
+  el.log.append(document.createTextNode(chunk));
+  if (autoScroll) el.log.scrollTop = el.log.scrollHeight;
+}
+
+async function connect() {
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    keepReading = true;
+    writer = port.writable.getWriter();
+    el.connect.disabled = true;
+    el.disconnect.disabled = false;
+    logText('✅ Verbonden.', 'ok');
+    readLoop();
+  } catch (e) {
+    logText(`❌ ${e.message}`, 'badnews');
+  }
+}
+
+async function disconnect() {
+  try {
+    keepReading = false;
+    paused = false;
+    if (reader) { try { await reader.cancel(); } catch (_) {} try { reader.releaseLock(); } catch(_){} reader = null; }
+    if (writer) { try { writer.releaseLock(); } catch(_){} writer = null; }
+    if (port) { await port.close(); port = null; }
+  } catch (e) {
+    logText(`❌ ${e.message}`, 'badnews');
+  } finally {
+    el.connect.disabled = false;
+    el.disconnect.disabled = true;
+    setModeButtons();
+    logText('🔌 Verbroken.');
+  }
+}
+
+async function readLoop() {
+  reader = port.readable.getReader();
+  try {
+    while (keepReading) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const chunk = decoder.decode(value);
+      appendChunk(chunk);
+    }
+  } catch (e) {
+    if (keepReading) logText(`📴 Leesfout: ${e.message}`, 'badnews');
+  } finally {
+    try { reader.releaseLock(); } catch(_) {}
+  }
+}
+
+async function sendRaw(text) {
+  if (!writer) { logText('⚠️ Niet verbonden.', 'badnews'); return; }
+  const data = encoder.encode(text);
+  try {
+    await writer.write(data);
+  } catch (e) {
+    logText(`❌ Schrijffout: ${e.message}`, 'badnews');
+  }
+}
+
+function getLineEnding() {
+  const v = el.lineEnding.value;
+  if (v === 'lf') return '\n';
+  if (v === 'crlf') return '\r\n';
+  return '';
+}
+
+function exportTxt() {
+  const content = el.log.textContent || '';
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  a.href = URL.createObjectURL(blob);
+  a.download = `serial-log-${ts}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+}
+
+el.connect.addEventListener('click', connect);
+el.disconnect.addEventListener('click', disconnect);
+
+el.auto.addEventListener('click', () => {
+  autoScroll = true;
+  setModeButtons();
+  el.log.scrollTop = el.log.scrollHeight;
+});
+el.manual.addEventListener('click', () => { autoScroll = false; setModeButtons(); });
+
+el.pause.addEventListener('click', () => {
+  paused = !paused;
+  setModeButtons();
+  if (!paused && pausedBuffer.length) {
+    const merged = pausedBuffer.join('');
+    pausedBuffer.length = 0;
+    appendChunk(merged);
+  }
+});
+
+el.clear.addEventListener('click', () => { el.log.textContent = ''; });
+el.export.addEventListener('click', exportTxt);
+
+el.btnSend.addEventListener('click', () => {
+  const t = el.sendInput.value;
+  if (!t) return;
+  sendRaw(t);
+});
+
+el.btnSendNL.addEventListener('click', () => {
+  const t = el.sendInput.value + getLineEnding();
+  if (!t) return;
+  sendRaw(t);
+});
+
+el.sendInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    const t = el.sendInput.value + getLineEnding();
+    if (!t) return;
+    sendRaw(t);
+  }
+});
+
+if (!('serial' in navigator)) {
+  el.supportMsg.textContent = ' (WebSerial niet gevonden — gebruik Chrome of Edge).';
+} else {
+  el.supportMsg.textContent = '';
+}
+
+// (optioneel) Ctrl+L om te clearen
+window.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.key.toLowerCase() === 'l') {
+    e.preventDefault();
+    el.log.textContent = '';
+  }
+});
+</script>
+</body>
+</html>
